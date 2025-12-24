@@ -58,20 +58,37 @@ export const getAllDiscounts = async (req, res) => {
       query.category = category;
     }
 
-    if (search) {
-      query.$or = [
-        { brand: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-      ];
-    }
+    // Note: Supabase doesn't support regex search like MongoDB
+    // For now, we'll skip the search functionality or implement it differently
+    // if (search) {
+    //   query.$or = [
+    //     { brand: { $regex: search, $options: 'i' } },
+    //     { description: { $regex: search, $options: 'i' } },
+    //   ];
+    // }
 
-    const discounts = await Discount.find(query)
-      .populate('vendorId', 'name email companyName')
-      .skip(skip)
-      .limit(parseInt(limit))
-      .sort({ createdAt: -1 });
+    const discounts = await Discount.find(query, {
+      skip: skip,
+      limit: parseInt(limit),
+      sort: { createdAt: -1 }
+    });
 
     const total = await Discount.countDocuments(query);
+
+    // Add vendor information manually since Supabase doesn't support populate
+    const discountsWithVendor = await Promise.all(
+      discounts.map(async (discount) => {
+        const vendor = await User.findById(discount.vendorId);
+        return {
+          ...discount,
+          vendor: vendor ? {
+            name: vendor.name,
+            email: vendor.email,
+            companyName: vendor.companyName
+          } : null
+        };
+      })
+    );
 
     res.status(200).json({
       success: true,
@@ -79,7 +96,7 @@ export const getAllDiscounts = async (req, res) => {
       total,
       page: parseInt(page),
       pages: Math.ceil(total / limit),
-      discounts,
+      discounts: discountsWithVendor,
     });
   } catch (error) {
     res.status(500).json({
@@ -91,12 +108,8 @@ export const getAllDiscounts = async (req, res) => {
 
 export const getDiscountById = async (req, res) => {
   try {
-    const discount = await Discount.findByIdAndUpdate(
-      req.params.id,
-      { $inc: { totalViews: 1 } },
-      { new: true }
-    ).populate('vendorId', 'name email companyName');
-
+    // First increment totalViews
+    const discount = await Discount.findById(req.params.id);
     if (!discount) {
       return res.status(404).json({
         success: false,
@@ -104,9 +117,25 @@ export const getDiscountById = async (req, res) => {
       });
     }
 
+    // Update totalViews
+    const updatedDiscount = await Discount.findByIdAndUpdate(req.params.id, {
+      totalViews: (discount.totalViews || 0) + 1
+    });
+
+    // Add vendor information manually
+    const vendor = await User.findById(updatedDiscount.vendorId);
+    const discountWithVendor = {
+      ...updatedDiscount,
+      vendor: vendor ? {
+        name: vendor.name,
+        email: vendor.email,
+        companyName: vendor.companyName
+      } : null
+    };
+
     res.status(200).json({
       success: true,
-      discount,
+      discount: discountWithVendor,
     });
   } catch (error) {
     res.status(500).json({
@@ -122,10 +151,11 @@ export const getVendorDiscounts = async (req, res) => {
     const { page = 1, limit = 10 } = req.query;
     const skip = (page - 1) * limit;
 
-    const discounts = await Discount.find({ vendorId })
-      .skip(skip)
-      .limit(parseInt(limit))
-      .sort({ createdAt: -1 });
+    const discounts = await Discount.find({ vendorId }, {
+      skip: skip,
+      limit: parseInt(limit),
+      sort: { createdAt: -1 }
+    });
 
     const total = await Discount.countDocuments({ vendorId });
 
@@ -237,27 +267,48 @@ export const redeemDiscount = async (req, res) => {
       });
     }
 
-    // Check if already used
-    const alreadyUsed = discount.usedBy.some((usage) => usage.studentId.toString() === studentId);
-    if (alreadyUsed) {
+    // Check if already used by querying discount_usage table
+    const { data: existingUsage, error: usageError } = await supabase
+      .from('discount_usage')
+      .select('*')
+      .eq('discount_id', id)
+      .eq('student_id', studentId)
+      .single();
+
+    if (usageError && usageError.code !== 'PGRST116') { // PGRST116 is "not found"
+      throw usageError;
+    }
+
+    if (existingUsage) {
       return res.status(400).json({
         success: false,
         message: 'You have already redeemed this discount',
       });
     }
 
-    discount.usageCount += 1;
-    discount.usedBy.push({
-      studentId,
-      usedAt: new Date(),
+    // Add to discount_usage table
+    const { error: insertError } = await supabase
+      .from('discount_usage')
+      .insert([{
+        discount_id: id,
+        student_id: studentId,
+        used_at: new Date().toISOString(),
+      }]);
+
+    if (insertError) throw insertError;
+
+    // Increment usage count
+    await Discount.findByIdAndUpdate(id, {
+      usageCount: (discount.usageCount || 0) + 1
     });
 
-    await discount.save();
+    // Get updated discount
+    const updatedDiscount = await Discount.findById(id);
 
     res.status(200).json({
       success: true,
       message: 'Discount redeemed successfully',
-      discount,
+      discount: updatedDiscount,
     });
   } catch (error) {
     res.status(500).json({
